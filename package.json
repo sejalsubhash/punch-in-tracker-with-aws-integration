@@ -4,7 +4,7 @@
   "description": "Team Punch-In/Out Tracking System",
   "scripts": {
     "start": "node backend/src/server.js",
-    "build": "cd frontend && npm install && npm run build",
+    "build": "npm install && cd frontend && npm install && npm run build",
     "dev:backend": "nodemon backend/src/server.js",
     "dev:frontend": "cd frontend && npm start",
     "install:all": "npm install && cd frontend && npm install"

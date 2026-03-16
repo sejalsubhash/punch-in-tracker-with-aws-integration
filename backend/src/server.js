@@ -3,6 +3,7 @@ const express = require("express");
 const cors = require("cors");
 const couchbase = require("couchbase");
 const { SNSClient, PublishCommand } = require("@aws-sdk/client-sns");
+const { S3Client, PutObjectCommand } = require("@aws-sdk/client-s3");
 const { v4: uuidv4 } = require("uuid");
 const path = require("path");
 
@@ -87,6 +88,130 @@ async function sendSNSNotification(message) {
   } catch (err) {
     console.error("❌ SNS error:", err.message);
   }
+}
+
+// ─── AWS S3 Setup ──────────────────────────────────────────────────────────────
+const s3Client = new S3Client({
+  region: process.env.AWS_REGION || "us-east-1",
+  credentials: {
+    accessKeyId:     process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
+});
+
+const S3_BUCKET = process.env.S3_BUCKET_NAME;
+
+// Convert records array to CSV string
+function recordsToCSV(records) {
+  if (!records || records.length === 0) {
+    return "Name,Action,Time,Date,Entry Type,Timestamp\n";
+  }
+
+  const headers = ["Name", "Action", "Time", "Date", "Entry Type", "Timestamp"];
+
+  const actionLabels = {
+    "punch-in":  "Punch In",
+    "break":     "Break",
+    "punch-out": "Punch Out",
+  };
+
+  const rows = records.map((r) => [
+    `"${(r.name      || "").replace(/"/g, '""')}"`,
+    `"${actionLabels[r.action] || r.action || ""}"`,
+    `"${r.time       || ""}"`,
+    `"${r.date       || ""}"`,
+    `"${r.entryType  === "manual" ? "Manual" : "Auto"}"`,
+    `"${r.timestamp  || ""}"`,
+  ]);
+
+  return [headers.join(","), ...rows.map((r) => r.join(","))].join("\n");
+}
+
+// Upload daily CSV to S3
+async function uploadDailyBackupToS3(dateStr) {
+  if (!S3_BUCKET) {
+    console.warn("⚠️  S3_BUCKET_NAME not set. Skipping S3 backup.");
+    return;
+  }
+
+  try {
+    // Fetch all records for the given date from Couchbase
+    const query = `
+      SELECT META().id AS id, doc.*
+      FROM \`${CB_BUCKET}\`.\`${CB_SCOPE}\`.\`${CB_COLLECTION}\` AS doc
+      WHERE doc.type = 'punch_record'
+        AND doc.date = $1
+      ORDER BY doc.createdAt ASC
+    `;
+    const result  = await cluster.query(query, { parameters: [dateStr] });
+    const records = result.rows;
+
+    const csvContent = recordsToCSV(records);
+    const s3Key      = `attendance-records/${dateStr}.csv`;
+
+    const command = new PutObjectCommand({
+      Bucket:      S3_BUCKET,
+      Key:         s3Key,
+      Body:        csvContent,
+      ContentType: "text/csv",
+      Metadata: {
+        "backup-date":    dateStr,
+        "total-records":  String(records.length),
+        "generated-at":   new Date().toISOString(),
+      },
+    });
+
+    await s3Client.send(command);
+    console.log(
+      `✅ S3 backup uploaded: s3://${S3_BUCKET}/${s3Key} (${records.length} records)`
+    );
+    return { success: true, key: s3Key, recordCount: records.length };
+  } catch (err) {
+    console.error("❌ S3 upload error:", err.message);
+    throw err;
+  }
+}
+
+// ─── Daily Scheduler ───────────────────────────────────────────────────────────
+// Runs once every 24 hours at midnight UTC
+function scheduleDailyBackup() {
+  const now       = new Date();
+  const midnight  = new Date(now);
+  midnight.setUTCHours(24, 0, 0, 0); // next midnight UTC
+
+  const msUntilMidnight = midnight.getTime() - now.getTime();
+
+  console.log(
+    `⏰ Daily S3 backup scheduled — next run in ${Math.round(msUntilMidnight / 1000 / 60)} minutes`
+  );
+
+  setTimeout(async () => {
+    // Run today's backup
+    const today = new Date();
+    today.setUTCDate(today.getUTCDate() - 0); // today
+    const pad     = (n) => String(n).padStart(2, "0");
+    const dateStr = `${today.getUTCFullYear()}-${pad(today.getUTCMonth() + 1)}-${pad(today.getUTCDate())}`;
+
+    console.log(`🗄️  Running daily S3 backup for ${dateStr}...`);
+    try {
+      await uploadDailyBackupToS3(dateStr);
+    } catch (err) {
+      console.error("❌ Scheduled backup failed:", err.message);
+    }
+
+    // Schedule next run (every 24 hours)
+    setInterval(async () => {
+      const d       = new Date();
+      const pad2    = (n) => String(n).padStart(2, "0");
+      const ds      = `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+      console.log(`🗄️  Running daily S3 backup for ${ds}...`);
+      try {
+        await uploadDailyBackupToS3(ds);
+      } catch (err) {
+        console.error("❌ Scheduled backup failed:", err.message);
+      }
+    }, 24 * 60 * 60 * 1000);
+  }, msUntilMidnight);
 }
 
 // ─── Team Members ──────────────────────────────────────────────────────────────
@@ -219,6 +344,36 @@ app.delete("/api/records/:id", async (req, res) => {
   }
 });
 
+// POST /api/backup — manually trigger S3 backup for a specific date
+app.post("/api/backup", async (req, res) => {
+  const { date } = req.body;
+  const pad      = (n) => String(n).padStart(2, "0");
+  const today    = new Date();
+  const dateStr  = date ||
+    `${today.getUTCFullYear()}-${pad(today.getUTCMonth() + 1)}-${pad(today.getUTCDate())}`;
+
+  try {
+    const result = await uploadDailyBackupToS3(dateStr);
+    res.json({
+      success:     true,
+      message:     `Backup uploaded to S3 for ${dateStr}`,
+      key:         result.key,
+      recordCount: result.recordCount,
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Backup failed", details: err.message });
+  }
+});
+
+// GET /api/backup/status — check S3 config status
+app.get("/api/backup/status", (req, res) => {
+  res.json({
+    s3Configured: !!S3_BUCKET,
+    s3Bucket:     S3_BUCKET || "not configured",
+    schedule:     "Daily at midnight UTC",
+  });
+});
+
 // ─── Serve React Build in Production ──────────────────────────────────────────
 if (process.env.NODE_ENV === "production") {
   app.use(express.static(path.join(__dirname, "../../frontend/build")));
@@ -233,4 +388,11 @@ initCouchbase().then(() => {
     console.log(`🚀 Server running on port ${PORT}`);
     console.log(`🌍 Environment: ${process.env.NODE_ENV || "development"}`);
   });
+
+  // Start daily S3 backup scheduler
+  if (S3_BUCKET) {
+    scheduleDailyBackup();
+  } else {
+    console.warn("⚠️  S3_BUCKET_NAME not set — daily backup scheduler disabled");
+  }
 });

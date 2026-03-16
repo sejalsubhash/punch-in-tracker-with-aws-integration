@@ -14,13 +14,14 @@
     "cors": "^2.8.5",
     "dotenv": "^16.3.1",
     "couchbase": "^4.3.0",
+    "uuid": "^9.0.0",
     "@aws-sdk/client-sns": "^3.450.0",
-   "uuid": "^9.0.0"
+    "@aws-sdk/client-s3": "^3.450.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.0.0"
   }
 }
